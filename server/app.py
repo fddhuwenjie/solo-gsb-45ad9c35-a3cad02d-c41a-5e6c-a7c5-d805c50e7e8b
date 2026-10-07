@@ -642,6 +642,79 @@ def _printed_paper(db, seal_id, paper):
     return questions, letters
 
 
+def _effective_letters(db, sheet_id):
+    """Effective answer per paper_question_id of one card.
+
+    Registered letters are the base; every correction group (oldest first)
+    overlays its items, so the newest group wins per question.  A letter of
+    None means an effective blank.  Registered rows are never modified.
+    """
+    effective = {
+        r["paper_question_id"]: r["letter"]
+        for r in db.execute(
+            "SELECT paper_question_id, letter FROM answer_sheet_item WHERE sheet_id = ?",
+            (sheet_id,),
+        ).fetchall()
+    }
+    rows = db.execute(
+        """SELECT ci.paper_question_id, ci.new_letter
+             FROM sheet_correction_item ci
+             JOIN sheet_correction c ON c.id = ci.correction_id
+            WHERE c.sheet_id = ?
+            ORDER BY c.id, ci.id""",
+        (sheet_id,),
+    ).fetchall()
+    for r in rows:
+        effective[r["paper_question_id"]] = r["new_letter"]
+    return effective
+
+
+def _option_code_map(db, seal_id, paper):
+    """{(paper_question_id, letter): sealed option stable code} for a paper."""
+    code_map = {}
+    for r in db.execute(
+        """SELECT po.paper_question_id, po.letter, so.stable_code
+             FROM paper p
+             JOIN paper_question pq ON pq.paper_id = p.id
+             JOIN paper_option po ON po.paper_question_id = pq.id
+             JOIN sealed_option so ON so.id = po.sealed_option_id
+            WHERE p.seal_id = ? AND p.name = ?""",
+        (seal_id, paper),
+    ).fetchall():
+        code_map[(r["paper_question_id"], r["letter"])] = r["stable_code"]
+    return code_map
+
+
+def _correction_history(db, sheet_id, code_map):
+    """Correction groups of one card, with before/after letters and codes."""
+    groups = []
+    for g in db.execute(
+        "SELECT id, reason, created_at FROM sheet_correction "
+        "WHERE sheet_id = ? ORDER BY id",
+        (sheet_id,),
+    ).fetchall():
+        items = []
+        for ci in db.execute(
+            """SELECT ci.paper_question_id, pq.number, ci.old_letter, ci.new_letter
+                 FROM sheet_correction_item ci
+                 JOIN paper_question pq ON pq.id = ci.paper_question_id
+                WHERE ci.correction_id = ? ORDER BY pq.number""",
+            (g["id"],),
+        ).fetchall():
+            items.append({
+                "number": ci["number"],
+                "old_letter": ci["old_letter"],
+                "new_letter": ci["new_letter"],
+                "old_option_code": code_map.get((ci["paper_question_id"], ci["old_letter"])),
+                "new_option_code": code_map.get((ci["paper_question_id"], ci["new_letter"])),
+            })
+        groups.append({
+            "id": g["id"], "reason": g["reason"], "created_at": g["created_at"],
+            "items": items,
+        })
+    return groups
+
+
 @app.post("/api/seals/<int:seal_id>/sheets")
 def create_sheet(seal_id):
     data = payload()
@@ -725,27 +798,152 @@ def create_sheet(seal_id):
     return jsonify({"ok": True, "sheet_id": sheet_id, "total_score": total})
 
 
-# Current score of every registered item, recomputed live from the stored
-# sealed option against the (possibly errata-updated) answer key.
-_CURRENT_TOTAL_SQL = """
-    (SELECT COUNT(*) FROM answer_sheet_item i
-       JOIN paper_question pq ON pq.id = i.paper_question_id
-       JOIN sealed_question sq ON sq.id = pq.sealed_question_id
-      WHERE i.sheet_id = s.id
-        AND i.sealed_option_id = sq.correct_sealed_option_id)"""
+@app.post("/api/seals/<int:seal_id>/sheets/<int:sheet_id>/corrections")
+def create_correction(seal_id, sheet_id):
+    data = payload()
+    reason = data.get("reason")
+    reason = reason.strip() if isinstance(reason, str) else ""
+    items_raw = data.get("items")
+    if not isinstance(items_raw, list) or not items_raw:
+        raise ApiError(400, "更正至少包含一条修正")
+
+    db = get_db()
+
+    # BEGIN IMMEDIATE serialises corrections against errata and releases:
+    # the whole group is validated against and written to one database state,
+    # so it lands either wholly inside a concurrent publish's snapshot or
+    # wholly in the next batch.
+    try:
+        db.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        raise ApiError(409, "另一个写入操作正在进行，请稍后重试")
+    try:
+        sheet = db.execute(
+            "SELECT id, paper FROM answer_sheet WHERE id = ? AND seal_id = ?",
+            (sheet_id, seal_id),
+        ).fetchone()
+        if sheet is None:
+            db.rollback()
+            raise ApiError(404, "答题卡不存在")
+        paper = sheet["paper"]
+        printed, letters = _printed_paper(db, seal_id, paper)
+
+        # Effective answers right now (registered overlaid with older groups).
+        effective = _effective_letters(db, sheet_id)
+
+        # ---- validate the whole group first; any flaw refuses all --------
+        prepared = []   # (pq_id, number, old, new)
+        seen = set()
+        for idx, it in enumerate(items_raw, start=1):
+            if not isinstance(it, dict):
+                db.rollback()
+                raise ApiError(400, f"第 {idx} 条更正格式错误，整次拒绝")
+            number = it.get("number")
+            if isinstance(number, bool) or not isinstance(number, int):
+                db.rollback()
+                raise ApiError(400, f"第 {idx} 条更正：题号格式错误，整次拒绝")
+            if number not in printed:
+                db.rollback()
+                raise ApiError(
+                    400, f"题号 {number} 不在 {paper} 卷印出的题号中，整次拒绝")
+            if number in seen:
+                db.rollback()
+                raise ApiError(400, f"题号 {number} 重复提交，整次拒绝")
+            seen.add(number)
+            pq_id = printed[number]["pq_id"]
+            letter = it.get("letter")
+            if letter is None or (isinstance(letter, str) and not letter.strip()):
+                new = None
+            elif isinstance(letter, str) \
+                    and letter.strip().upper() in letters[pq_id]:
+                new = letter.strip().upper()
+            else:
+                db.rollback()
+                raise ApiError(
+                    400, f"第 {number} 题：更正字母 {letter!r} 不属于该题选项，整次拒绝")
+            prepared.append((pq_id, number, effective[pq_id], new))
+
+        if all(old == new for _, _, old, new in prepared):
+            db.rollback()
+            raise ApiError(400, "整组更正与当前作答完全相同，整次拒绝且不留记录")
+
+        # ---- write the group (registered answers stay untouched) ---------
+        group_id = db.execute(
+            "INSERT INTO sheet_correction (sheet_id, reason) VALUES (?, ?)",
+            (sheet_id, reason),
+        ).lastrowid
+        for pq_id, _number, old, new in prepared:
+            db.execute(
+                "INSERT INTO sheet_correction_item "
+                "(correction_id, paper_question_id, old_letter, new_letter) "
+                "VALUES (?, ?, ?, ?)",
+                (group_id, pq_id, old, new),
+            )
+        db.commit()
+    except ApiError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        db.rollback()
+        raise ApiError(500, f"更正写入失败，已回滚：{exc}")
+
+    return jsonify({
+        "ok": True,
+        "correction_id": group_id,
+        "applied": [
+            {"number": number, "old": old, "new": new}
+            for _, number, old, new in prepared
+        ],
+    })
 
 
+@app.get("/api/seals/<int:seal_id>/sheets/<int:sheet_id>/corrections")
+def list_corrections(seal_id, sheet_id):
+    db = get_db()
+    sheet = db.execute(
+        "SELECT id, paper FROM answer_sheet WHERE id = ? AND seal_id = ?",
+        (sheet_id, seal_id),
+    ).fetchone()
+    if sheet is None:
+        raise ApiError(404, "答题卡不存在")
+    code_map = _option_code_map(db, seal_id, sheet["paper"])
+    groups = _correction_history(db, sheet_id, code_map)
+    return jsonify({"ok": True, "corrections": groups})
+
+
+# Current score is computed in Python from the effective answers (registered
+# letter overlaid with every correction group, newest wins) graded against
+# the current (possibly errata-updated) answer key.  Registered data is only
+# ever read, never rewritten.
 @app.get("/api/seals/<int:seal_id>/sheets")
 def list_sheets(seal_id):
     db = get_db()
     if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
         raise ApiError(404, "封存卷不存在")
+    correct_of = {
+        r["id"]: r["correct_sealed_option_id"]
+        for r in db.execute(
+            "SELECT id, correct_sealed_option_id FROM sealed_question WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchall()
+    }
     sheets = [dict(r) for r in db.execute(
-        f"""SELECT s.id, s.paper, s.examinee, s.total_score, s.created_at,
-                   {_CURRENT_TOTAL_SQL} AS current_total
-              FROM answer_sheet s WHERE s.seal_id = ? ORDER BY s.id""",
+        """SELECT s.id, s.paper, s.examinee, s.total_score, s.created_at,
+                  (SELECT COUNT(*) FROM sheet_correction c WHERE c.sheet_id = s.id)
+                      AS correction_count
+             FROM answer_sheet s WHERE s.seal_id = ? ORDER BY s.id""",
         (seal_id,),
     ).fetchall()]
+    # one shared letter -> sealed-option map per paper
+    paper_meta = {p: _printed_paper(db, seal_id, p) for p in ("A", "B")}
+    for sh in sheets:
+        _printed, letters = paper_meta[sh["paper"]]
+        pq_to_sq = {pq: v["sealed_question_id"] for pq, v in _printed.items()}
+        current_total = 0
+        for pq_id, letter in _effective_letters(db, sh["id"]).items():
+            so_id = letters[pq_id][letter] if letter else None
+            if so_id is not None and so_id == correct_of[pq_to_sq[pq_id]]:
+                current_total += 1
+        sh["current_total"] = current_total
     return jsonify({"ok": True, "sheets": sheets})
 
 
@@ -759,44 +957,75 @@ def get_sheet(seal_id, sheet_id):
     ).fetchone()
     if sheet is None:
         raise ApiError(404, "答题卡不存在")
+    printed, letters = _printed_paper(db, seal_id, sheet["paper"])
+    code_map = _option_code_map(db, seal_id, sheet["paper"])
+    correct_of = {
+        r["id"]: r["correct_sealed_option_id"]
+        for r in db.execute(
+            "SELECT id, correct_sealed_option_id FROM sealed_question WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchall()
+    }
+
+    # Registered per-question rows in printed-number order.
+    reg = {}
+    for r in db.execute(
+        """SELECT i.paper_question_id, i.letter, i.score
+             FROM answer_sheet_item i
+            WHERE i.sheet_id = ?""",
+        (sheet_id,),
+    ).fetchall():
+        reg[r["paper_question_id"]] = r
+
+    # Effective answers = registered overlaid with corrections (newest wins).
+    effective = _effective_letters(db, sheet_id)
+
     items = []
     changes = []
     current_total = 0
-    for r in db.execute(
-        """SELECT i.letter, i.score, i.sealed_option_id,
-                  pq.number, so.stable_code AS option_code,
-                  sq.correct_sealed_option_id
-             FROM answer_sheet_item i
-             JOIN paper_question pq ON pq.id = i.paper_question_id
-             JOIN sealed_question sq ON sq.id = pq.sealed_question_id
-             LEFT JOIN sealed_option so ON so.id = i.sealed_option_id
-            WHERE i.sheet_id = ? ORDER BY pq.number""",
-        (sheet_id,),
-    ).fetchall():
-        current = 1 if (r["sealed_option_id"] is not None
-                        and r["sealed_option_id"] == r["correct_sealed_option_id"]) else 0
+    for number in sorted(printed):
+        pq_id = printed[number]["pq_id"]
+        sq_id = printed[number]["sealed_question_id"]
+        row = reg[pq_id]
+        eff_letter = effective[pq_id]
+        eff_so = letters[pq_id][eff_letter] if eff_letter else None
+        current = 1 if (eff_so is not None and eff_so == correct_of[sq_id]) else 0
         current_total += current
-        items.append({
-            "number": r["number"],
-            "letter": r["letter"],
-            "option_code": r["option_code"],
-            "registered_score": r["score"],
+        reg_letter = row["letter"]
+        reg_so = letters[pq_id][reg_letter] if reg_letter else None
+        item = {
+            "number": number,
+            "letter": reg_letter,
+            "option_code": code_map.get((pq_id, reg_letter)),
+            "registered_score": row["score"],
+            "effective_letter": eff_letter,
+            "effective_option_code": code_map.get((pq_id, eff_letter)),
             "current_score": current,
-        })
-        if current != r["score"]:
+            "corrected": reg_letter != eff_letter,
+        }
+        items.append(item)
+        # 复核相对【登记分数】的逐题变化：可能来自勘误，也可能来自更正。
+        if current != row["score"]:
             changes.append({
-                "number": r["number"], "letter": r["letter"],
-                "before": r["score"], "after": current,
+                "number": number,
+                "letter": reg_letter,
+                "effective_letter": eff_letter,
+                "corrected": reg_letter != eff_letter,
+                "before": row["score"], "after": current,
             })
+
+    groups = _correction_history(db, sheet_id, code_map)
     return jsonify({
         "ok": True,
         "sheet": {
             "id": sheet["id"], "paper": sheet["paper"], "examinee": sheet["examinee"],
             "total_score": sheet["total_score"], "current_total": current_total,
             "created_at": sheet["created_at"],
+            "correction_count": len(groups),
         },
         "items": items,
         "changes": changes,
+        "corrections": groups,
     })
 
 
@@ -819,10 +1048,10 @@ def create_release(seal_id):
         raise ApiError(404, "封存卷不存在")
 
     # BEGIN IMMEDIATE takes the write lock up front: the roster, the answer
-    # key and every per-question score are read and snapshotted inside one
-    # transaction, so a registration or erratum racing the publish lands
-    # either wholly in this batch or wholly in the next one — never an old
-    # roster graded by a newer key.
+    # key, every correction group and every per-question score are read and
+    # snapshotted inside one transaction, so a registration, erratum or
+    # correction racing the publish lands either wholly in this batch or
+    # wholly in the next one — never an old roster graded by a newer key.
     try:
         db.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError:
@@ -859,20 +1088,22 @@ def create_release(seal_id):
                 "VALUES (?, ?, ?, 0)",
                 (batch_id, sh["paper"], sh["examinee"]),
             ).lastrowid
+            # effective answers: registered letters overlaid with every
+            # correction group accepted before this transaction
+            printed, letters = _printed_paper(db, seal_id, sh["paper"])
+            pq_to_sq = {pq: v["sealed_question_id"] for pq, v in printed.items()}
+            effective = _effective_letters(db, sh["id"])
             total = 0
-            for it in db.execute(
-                """SELECT i.sealed_option_id, pq.number, pq.sealed_question_id
-                     FROM answer_sheet_item i
-                     JOIN paper_question pq ON pq.id = i.paper_question_id
-                    WHERE i.sheet_id = ? ORDER BY pq.number""",
-                (sh["id"],),
-            ).fetchall():
-                score = 1 if (it["sealed_option_id"] is not None
-                              and it["sealed_option_id"] == correct_of[it["sealed_question_id"]]) else 0
+            for number in sorted(printed):
+                pq_id = printed[number]["pq_id"]
+                letter = effective[pq_id]
+                so_id = letters[pq_id][letter] if letter else None
+                score = 1 if (so_id is not None
+                              and so_id == correct_of[pq_to_sq[pq_id]]) else 0
                 total += score
                 db.execute(
                     "INSERT INTO release_item (release_sheet_id, number, score) VALUES (?, ?, ?)",
-                    (rs_id, it["number"], score),
+                    (rs_id, number, score),
                 )
             db.execute("UPDATE release_sheet SET total_score = ? WHERE id = ?", (total, rs_id))
         db.commit()

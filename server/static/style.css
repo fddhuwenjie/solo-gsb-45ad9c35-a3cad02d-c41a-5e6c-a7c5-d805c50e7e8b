@@ -141,6 +141,7 @@ table.data th { background: #f6f8fb; }
 .sheet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 4px 14px; margin: 4px 0 6px; }
 .sheet-grid .sheet-cell label { margin: 0; }
 table.data tr.changed td { background: #fdf6e3; }
+table.data tr.corrected-row td { background: #eef3fb; }
 
 @media print {
   body { background: #fff; }

@@ -84,8 +84,8 @@ function renderHome() {
         h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
       ),
       h("div", { class: "card" },
-        h("h3", null, "⑤ 登记答题卡与复核"),
-        h("p", { class: "small muted" }, "按封存卷印出的题号登记考生作答（每题 1 分、空白 0 分）；勘误后按原作答的封存选项重新核分，对照登记成绩与当前成绩。"),
+        h("h3", null, "⑤ 登记答题卡、誊录更正与复核"),
+        h("p", { class: "small muted" }, "按封存卷印出的题号登记考生作答（每题 1 分、空白 0 分）；发现誊录错误可在卡片详情整组提交更正（可改为空白），原登记作答与登记分数不变、逐次留痕。复核按最新有效作答对应当前勘误答案重新核分，逐题对照登记分数。"),
         h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
       ),
       h("div", { class: "card" },
@@ -621,7 +621,8 @@ function sheetRegisterPanel() {
     h("h3", null, "登记答题卡"),
     h("p", { class: "small muted" },
       "按所选卷别印出的题号逐题选择作答字母，可留空（空白计 0 分，每题 1 分）。" +
-      "同一考生在同一封存版本只能登记一张；题号缺失、重复、多余或字母不属于该题时整张拒绝。"),
+      "同一考生在同一封存版本只能登记一张；题号缺失、重复、多余或字母不属于该题时整张拒绝。" +
+      "登记后若发现誊录错误，可在卡片详情提交更正，原登记作答与登记分数不会被改动。"),
     h("div", { class: "grid2" },
       h("div", null, h("label", null, "卷别"), paperSel),
       h("div", null, h("label", null, "考生编号"), examinee)),
@@ -667,64 +668,182 @@ function sheetListPanel() {
       h("td", null, sh.paper + " 卷"),
       h("td", null, String(sh.total_score)),
       h("td", null, h("span", { class: "pill " + (diff ? "warn" : "ok") }, String(sh.current_total))),
+      h("td", null, sh.correction_count > 0
+        ? h("span", { class: "pill warn" }, sh.correction_count + " 次更正")
+        : h("span", { class: "pill" }, "无")),
       h("td", null, sh.created_at),
       h("td", null, h("button", {
         class: "mini ghost",
-        onclick: async () => {
-          try {
-            sheetState.detail = (await api(
-              "GET", `/api/seals/${sealState.detail.id}/sheets/${sh.id}`));
-            renderSealDetailBody();
-          } catch (e) { toast(e.message, "err"); }
-        }
-      }, "查看复核")));
+        onclick: () => openSheetDetail(sh.id),
+      }, "查看复核 / 更正")));
   });
   card.appendChild(h("table", { class: "data" },
     h("thead", null, h("tr", null,
       h("th", null, "考生编号"), h("th", null, "卷别"), h("th", null, "登记成绩"),
-      h("th", null, "当前成绩"), h("th", null, "登记时间"), h("th", null, "操作"))),
+      h("th", null, "当前成绩"), h("th", null, "誊录更正"), h("th", null, "登记时间"),
+      h("th", null, "操作"))),
     h("tbody", null, ...rows)));
   card.appendChild(h("p", { class: "small muted" },
-    "当前成绩按最新答案表（含历次勘误）对原作答的封存选项重新核分；登记成绩与作答记录不变。"));
+    "当前成绩按最新有效作答（登记作答叠加历次誊录更正）对应当前答案表（含历次勘误）重新核分；" +
+    "登记成绩与原登记作答始终不变。"));
   return card;
+}
+
+function letterText(L) { return L || "（空白）"; }
+
+async function openSheetDetail(sheetId) {
+  const sid = sealState.detail.id;
+  try {
+    const [detail, corr] = await Promise.all([
+      api("GET", `/api/seals/${sid}/sheets/${sheetId}`),
+      api("GET", `/api/seals/${sid}/sheets/${sheetId}/corrections`),
+    ]);
+    // 详情接口已带 corrections；以独立回看接口结果为准（同状态一致）
+    detail.corrections = corr.corrections;
+    detail.sheet.correction_count = corr.corrections.length;
+    sheetState.detail = detail;
+    renderSealDetailBody();
+  } catch (e) { toast(e.message, "err"); }
 }
 
 function sheetDetailPanel() {
   const d = sheetState.detail;
   const sh = d.sheet;
   const diff = sh.current_total !== sh.total_score;
-  const card = h("div", { class: "card" },
+  const card = h("div", { class: "card screen-only" },
     h("h3", null, `答题卡复核 · 考生 ${sh.examinee} · ${sh.paper} 卷`),
     h("p", { class: "small muted" }, `登记时间 ${sh.created_at}`),
     h("p", null,
       "登记成绩 ", h("span", { class: "pill ok" }, sh.total_score + " 分"),
-      "　当前成绩 ", h("span", { class: "pill " + (diff ? "warn" : "ok") }, sh.current_total + " 分")));
+      "　当前成绩 ", h("span", { class: "pill " + (diff ? "warn" : "ok") }, sh.current_total + " 分"),
+      "　已誊录更正 ",
+      h("span", { class: "pill " + (sh.correction_count ? "warn" : "") }, sh.correction_count + " 次")));
   if (d.changes.length) {
     card.appendChild(h("div", { class: "note-box" },
-      "勘误后得分变化：" + d.changes
-        .map(c => `第 ${c.number} 题 ${c.before} → ${c.after}`).join("；")));
+      "相对登记分数的逐题变化（按最新有效作答对应当前勘误答案核分）：" + d.changes
+        .map(c => `第 ${c.number} 题 ${letterText(c.letter)}→${letterText(c.effective_letter)}：` +
+          `${c.before} → ${c.after}${c.corrected ? "（含誊录更正）" : ""}`).join("；")));
   } else {
-    card.appendChild(h("p", { class: "small muted" }, "历次勘误未改变本张答题卡的逐题得分。"));
+    card.appendChild(h("p", { class: "small muted" },
+      "按最新有效作答与当前答案表核分，各题得分与登记得分一致。"));
   }
   const rows = d.items.map(it => {
     const changed = it.registered_score !== it.current_score;
-    return h("tr", changed ? { class: "changed" } : null,
+    const corrected = it.corrected;
+    return h("tr", changed ? { class: "changed" } : (corrected ? { class: "corrected-row" } : null),
       h("td", null, String(it.number)),
-      h("td", null, it.letter || "（空白）"),
-      h("td", null, h("span", { class: "ocode" }, it.option_code || "—")),
+      h("td", null, letterText(it.letter), h("br"),
+        h("span", { class: "ocode" }, it.option_code || "—")),
+      h("td", null, letterText(it.effective_letter), h("br"),
+        h("span", { class: "ocode" }, it.effective_option_code || "—")),
       h("td", null, String(it.registered_score)),
       h("td", null, String(it.current_score)));
   });
   card.appendChild(h("table", { class: "data" },
     h("thead", null, h("tr", null,
-      h("th", null, "题号"), h("th", null, "作答字母"), h("th", null, "封存选项"),
+      h("th", null, "题号"),
+      h("th", null, "登记作答字母 / 封存选项"),
+      h("th", null, "有效作答字母 / 封存选项"),
       h("th", null, "登记得分"), h("th", null, "当前得分"))),
     h("tbody", null, ...rows)));
-  card.appendChild(h("div", { class: "toolbar no-print" },
+  card.appendChild(h("div", { class: "toolbar" },
     h("button", {
       class: "ghost",
       onclick: () => { sheetState.detail = null; renderSealDetailBody(); }
     }, "← 返回列表")));
+  return card;
+}
+
+function sheetCorrectionFormPanel() {
+  const d = sheetState.detail;
+  const sh = d.sheet;
+  const s = sealState.detail;
+  const paper = s.papers[sh.paper];
+  const byNumber = {};
+  d.items.forEach(it => { byNumber[it.number] = it; });
+
+  const reason = h("input", { type: "text", placeholder: "更正原因（如：誊录串行 / 考生申请复核）" });
+  const grid = h("div", { class: "sheet-grid" });
+  const result = h("div");
+
+  paper.questions.forEach(q => {
+    const cur = byNumber[q.number].effective_letter || "";
+    const sel = h("select", { "data-number": q.number, "data-current": cur },
+      h("option", { value: "" }, "（空白）"),
+      ...LETTERS.map(L => h("option", { value: L }, L)));
+    sel.value = cur;
+    grid.appendChild(h("div", { class: "sheet-cell" },
+      h("label", null, `第 ${q.number} 题（当前 ${letterText(cur)}）`), sel));
+  });
+
+  return h("div", { class: "card screen-only" },
+    h("h3", null, "誊录更正"),
+    h("p", { class: "small muted" },
+      "按本卡 " + sh.paper + " 卷印出的题号，把誊录错误的题改为正确选项（可改为空白）。" +
+      "只接受本卡所属卷的题号与选项；题号重复、字母无效、或整组与当前作答相同，整次拒绝且不留记录。" +
+      "原登记作答与登记分数保持不变；仅提交与当前作答不同的题。"),
+    h("label", null, "更正原因"), reason,
+    h("label", null, "逐题选择更正后的字母（不选即为空白）"),
+    grid,
+    h("div", { class: "toolbar" },
+      h("button", {
+        onclick: async () => {
+          const items = [...grid.querySelectorAll("select")]
+            .filter(sel => sel.value !== sel.dataset.current)
+            .map(sel => ({ number: Number(sel.dataset.number), letter: sel.value || null }));
+          result.replaceChildren();
+          if (!items.length) {
+            result.replaceChildren(h("p", { class: "pill err" },
+              "没有任何一题与当前作答不同，整次更正拒绝且不留记录。"));
+            return;
+          }
+          try {
+            await api("POST",
+              `/api/seals/${s.id}/sheets/${sh.id}/corrections`,
+              { reason: reason.value, items });
+            toast("誊录更正已生效；原登记作答与登记分数不变", "ok");
+            // 列表上的当前成绩 / 更正次数也要同步
+            sheetState.list = (await api("GET", `/api/seals/${s.id}/sheets`)).sheets;
+            await openSheetDetail(sh.id);
+          } catch (e) {
+            result.replaceChildren(h("p", { class: "pill err" }, "整次拒绝，未留下记录：" + e.message));
+          }
+        }
+      }, "提交更正（全部生效或全部不留记录）")),
+    result);
+}
+
+function correctionHistoryPanel() {
+  const groups = sheetState.detail.corrections || [];
+  const card = h("div", { class: "card screen-only" },
+    h("h3", null, "誊录更正记录（逐次保存生效前后字母与原因）"));
+  if (!groups.length) {
+    card.appendChild(h("p", { class: "muted small" }, "本卡尚无更正。"));
+    return card;
+  }
+  groups.forEach((g, gi) => {
+    card.appendChild(h("h2", { style: "margin-top:14px" },
+      `第 ${gi + 1} 次更正 · ${g.created_at}`,
+      g.reason ? h("span", { class: "muted small" }, "　原因：" + g.reason)
+               : h("span", { class: "muted small" }, "　未填原因")));
+    const trs = g.items.map(it => {
+      const changed = it.old_letter !== it.new_letter;
+      return h("tr", changed ? { class: "corrected-row" } : null,
+        h("td", null, "第 " + it.number + " 题"),
+        h("td", null, letterText(it.old_letter), h("br"),
+          h("span", { class: "ocode" }, it.old_option_code || "—")),
+        h("td", null, letterText(it.new_letter), h("br"),
+          h("span", { class: "ocode" }, it.new_option_code || "—")));
+    });
+    card.appendChild(h("table", { class: "data" },
+      h("thead", null, h("tr", null,
+        h("th", null, "题号"),
+        h("th", null, "生效前字母 / 封存选项"),
+        h("th", null, "生效后字母 / 封存选项"))),
+      h("tbody", null, ...trs)));
+  });
+  card.appendChild(h("p", { class: "small muted" },
+    "更正只逐次追加、不改动原登记；复核与发布按最新一次有效更正后的作答核分。"));
   return card;
 }
 
@@ -736,10 +855,12 @@ function releasePublishPanel() {
   return h("div", { class: "card screen-only" },
     h("h3", null, "发布成绩批次"),
     h("p", { class: "small muted" },
-      "把本封存版本当前已登记的全部答题卡，按当前答案表（含已生效勘误）核分并保存为一个不可变批次：" +
+      "把本封存版本当前已登记的全部答题卡，按其最新有效作答（登记作答叠加历次誊录更正）" +
+      "对应当前答案表（含已生效勘误）核分，并保存为一个不可变批次：" +
       "名单按卷别、考生编号排序记录总分，并保存每张卡按印出题号排列的逐题得分。" +
-      "名单与得分取自同一数据库状态——与发布交错的登记或勘误要么整体进入本批，要么整体留到下一批。" +
-      "已发布批次不随之后的登记、勘误或题库修改改变；没有已登记答题卡时拒绝发布。"),
+      "名单、有效作答与答案取自同一个数据库状态——与发布交错的登记、勘误或誊录更正" +
+      "要么整体进入本批，要么整体留到下一批。" +
+      "已发布批次不随之后的登记、勘误、更正或题库修改改变；没有已登记答题卡时拒绝发布。"),
     h("div", { class: "toolbar" },
       h("button", {
         onclick: async () => {
@@ -806,7 +927,7 @@ function releaseDiffBox(diff) {
   if (diff.changes.length) {
     box.appendChild(h("div", null, "得分变化考生的总分对照：" +
       diff.totals.map(t => `${t.examinee}（${t.paper} 卷）${t.before} → ${t.after}`).join("；") +
-      "。逐题变化如下（总分相抵的也一并列出）："));
+      "。逐题变化如下（可由勘误或誊录更正引起；总分相抵的也一并列出）："));
     const trs = diff.changes.map(c => h("tr", null,
       h("td", null, c.examinee),
       h("td", null, c.paper + " 卷"),
@@ -911,6 +1032,8 @@ function renderSealDetailBody() {
     case "sheets":
       if (sheetState.detail) {
         content.appendChild(sheetDetailPanel());
+        content.appendChild(sheetCorrectionFormPanel());
+        content.appendChild(correctionHistoryPanel());
       } else {
         content.appendChild(sheetRegisterPanel());
         content.appendChild(sheetListPanel());
