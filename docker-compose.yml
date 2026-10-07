@@ -1,0 +1,13 @@
+services:
+  dual-paper:
+    build: .
+    image: dual-paper-check:latest
+    container_name: dual-paper-check
+    ports:
+      - "8000:8000"
+    volumes:
+      - exam-data:/data
+    restart: unless-stopped
+
+volumes:
+  exam-data:
