@@ -120,6 +120,28 @@ CREATE TABLE IF NOT EXISTS answer_sheet_item (
     UNIQUE(sheet_id, paper_question_id)
 );
 
+-- Transcription corrections of a registered answer card.  A correction never
+-- rewrites answer_sheet / answer_sheet_item: the registered letters and the
+-- registered score stay forever as they were at registration time.  The
+-- effective answer of a question is the newest correction item for it when
+-- one exists, otherwise the original registered item.  Like errata, a whole
+-- correction request is either applied together or refused with no trace.
+CREATE TABLE IF NOT EXISTS answer_correction_batch (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sheet_id   INTEGER NOT NULL REFERENCES answer_sheet(id) ON DELETE CASCADE,
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS answer_correction_item (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id          INTEGER NOT NULL
+        REFERENCES answer_correction_batch(id) ON DELETE CASCADE,
+    paper_question_id INTEGER NOT NULL REFERENCES paper_question(id) ON DELETE CASCADE,
+    old_letter        TEXT CHECK(old_letter IN ('A','B','C','D')),  -- NULL = 空白
+    new_letter        TEXT CHECK(new_letter IN ('A','B','C','D')),  -- NULL = 空白
+    UNIQUE(batch_id, paper_question_id)
+);
+
 -- Erratum batch: all items succeed together or the whole request is refused.
 CREATE TABLE IF NOT EXISTS erratum_batch (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
